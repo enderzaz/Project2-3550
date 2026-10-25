@@ -3,8 +3,11 @@ package main
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"math/big"
@@ -13,18 +16,14 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	_ "modernc.org/sqlite"
 )
 
-type KeyPair struct {
-	ID         string
-	PrivateKey *rsa.PrivateKey
-	PublicKey  *rsa.PublicKey
-	Expiry     time.Time
-}
+const dbFileName = "totally_not_my_privateKeys.db"
 
 type Server struct {
-	mu   sync.RWMutex
-	keys map[string]KeyPair
+	db *sql.DB
+	mu sync.Mutex
 }
 
 type JWK struct {
@@ -40,29 +39,66 @@ type JWKS struct {
 	Keys []JWK `json:"keys"`
 }
 
-func NewServer() *Server {
-	s := &Server{
-		keys: make(map[string]KeyPair),
+func NewServer(dbPath string) (*Server, error) {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
-	s.generateKey("active-key-1", time.Now().Add(24*time.Hour))
-	s.generateKey("expired-key-1", time.Now().Add(-1*time.Hour))
-	return s
+
+	createTableQuery := `
+	CREATE TABLE IF NOT EXISTS keys(
+		kid INTEGER PRIMARY KEY AUTOINCREMENT,
+		key BLOB NOT NULL,
+		exp INTEGER NOT NULL
+	);
+	`
+	if _, err := db.Exec(createTableQuery); err != nil {
+		return nil, fmt.Errorf("failed to create table: %w", err)
+	}
+
+	s := &Server{db: db}
+	if err := s.ensureInitialKeys(); err != nil {
+		return nil, fmt.Errorf("failed to ensure initial keys: %w", err)
+	}
+
+	return s, nil
 }
 
-func (s *Server) generateKey(kid string, expiry time.Time) {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		log.Fatalf("Failed to generate RSA key pair: %v", err)
-	}
-
+func (s *Server) ensureInitialKeys() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.keys[kid] = KeyPair{
-		ID:         kid,
-		PrivateKey: priv,
-		PublicKey:  &priv.PublicKey,
-		Expiry:     expiry,
+
+	var count int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM keys").Scan(&count)
+	if err != nil {
+		return err
 	}
+
+	if count == 0 {
+		if err := s.generateAndSaveKey(time.Now().Add(24 * time.Hour)); err != nil {
+			return err
+		}
+		if err := s.generateAndSaveKey(time.Now().Add(-1 * time.Hour)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) generateAndSaveKey(expiry time.Time) error {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+
+	derBytes := x509.MarshalPKCS1PrivateKey(priv)
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: derBytes,
+	})
+
+	_, err = s.db.Exec("INSERT INTO keys (key, exp) VALUES (?, ?)", pemBytes, expiry.Unix())
+	return err
 }
 
 func (s *Server) JWKSHandler(w http.ResponseWriter, r *http.Request) {
@@ -71,26 +107,47 @@ func (s *Server) JWKSHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	now := time.Now().Unix()
+	rows, err := s.db.Query("SELECT kid, key, exp FROM keys WHERE exp > ?", now)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
 
 	var validKeys []JWK
-	now := time.Now()
 
-	for _, kp := range s.keys {
-		if kp.Expiry.After(now) {
-			nStr := base64.RawURLEncoding.EncodeToString(kp.PublicKey.N.Bytes())
-			eStr := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(kp.PublicKey.E)).Bytes())
+	for rows.Next() {
+		var kid int
+		var keyBlob []byte
+		var exp int64
 
-			validKeys = append(validKeys, JWK{
-				Kty: "RSA",
-				Use: "sig",
-				Alg: "RS256",
-				Kid: kp.ID,
-				N:   nStr,
-				E:   eStr,
-			})
+		if err := rows.Scan(&kid, &keyBlob, &exp); err != nil {
+			continue
 		}
+
+		block, _ := pem.Decode(keyBlob)
+		if block == nil {
+			continue
+		}
+
+		privKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil {
+			continue
+		}
+
+		pubKey := &privKey.PublicKey
+		nStr := base64.RawURLEncoding.EncodeToString(pubKey.N.Bytes())
+		eStr := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pubKey.E)).Bytes())
+
+		validKeys = append(validKeys, JWK{
+			Kty: "RSA",
+			Use: "sig",
+			Alg: "RS256",
+			Kid: fmt.Sprintf("%d", kid),
+			N:   nStr,
+			E:   eStr,
+		})
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -103,28 +160,37 @@ func (s *Server) AuthHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	useExpired := r.URL.Query().Get("expired") == "true"
+	_ = r.ParseForm()
 
-	s.mu.RLock()
-	var selectedKey KeyPair
-	found := false
-	now := time.Now()
+	useExpired := r.URL.Query().Has("expired")
+	now := time.Now().Unix()
 
-	for _, kp := range s.keys {
-		if useExpired && kp.Expiry.Before(now) {
-			selectedKey = kp
-			found = true
-			break
-		} else if !useExpired && kp.Expiry.After(now) {
-			selectedKey = kp
-			found = true
-			break
-		}
+	var query string
+	if useExpired {
+		query = "SELECT kid, key, exp FROM keys WHERE exp <= ? ORDER BY exp DESC LIMIT 1"
+	} else {
+		query = "SELECT kid, key, exp FROM keys WHERE exp > ? ORDER BY exp ASC LIMIT 1"
 	}
-	s.mu.RUnlock()
 
-	if !found {
+	var kid int
+	var keyBlob []byte
+	var exp int64
+
+	err := s.db.QueryRow(query, now).Scan(&kid, &keyBlob, &exp)
+	if err != nil {
 		http.Error(w, "No suitable key found to sign token", http.StatusInternalServerError)
+		return
+	}
+
+	block, _ := pem.Decode(keyBlob)
+	if block == nil {
+		http.Error(w, "Failed to decode private key", http.StatusInternalServerError)
+		return
+	}
+
+	privKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		http.Error(w, "Failed to parse private key", http.StatusInternalServerError)
 		return
 	}
 
@@ -141,9 +207,9 @@ func (s *Server) AuthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	token.Header["kid"] = selectedKey.ID
+	token.Header["kid"] = fmt.Sprintf("%d", kid)
 
-	signedString, err := token.SignedString(selectedKey.PrivateKey)
+	signedString, err := token.SignedString(privKey)
 	if err != nil {
 		http.Error(w, "Failed to sign token", http.StatusInternalServerError)
 		return
@@ -156,7 +222,11 @@ func (s *Server) AuthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	server := NewServer()
+	server, err := NewServer(dbFileName)
+	if err != nil {
+		log.Fatalf("Failed to initialize server: %v", err)
+	}
+	defer server.db.Close()
 
 	http.HandleFunc("/.well-known/jwks.json", server.JWKSHandler)
 	http.HandleFunc("/auth", server.AuthHandler)
