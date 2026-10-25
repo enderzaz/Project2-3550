@@ -228,10 +228,13 @@ func main() {
 	}
 	defer server.db.Close()
 
-	http.HandleFunc("/.well-known/jwks.json", server.JWKSHandler)
-	http.HandleFunc("/auth", server.AuthHandler)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/jwks.json", server.JWKSHandler)
+	mux.HandleFunc("/auth", server.AuthHandler)
 
 	port := "8080"
-	fmt.Printf("JWKS Server listening on http://localhost:%s\n", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	log.Printf("JWKS Server listening on http://localhost:%s", port)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
+		log.Fatalf("Server failed: %v", err)
+	}
 }
